@@ -26,6 +26,46 @@ pub(crate) fn run_transport(app: &mut SolveApp, control: crate::ui_kit::HistoryT
     let _ = app.run_heavy("timeline.roll_to", params);
 }
 
+/// The feature that made a face, edge or vertex of `body` (its world name): a face's own creator,
+/// as Edit Feature on a face finds it (the hole, not the plate it was cut into), else the feature
+/// that made the body.
+fn geometry_feature(app: &SolveApp, body: &str, face: Option<usize>) -> Option<u64> {
+    face.and_then(|index| crate::context_menu::face_feature(app, body, index))
+        .or_else(|| app.session.world_state().body(body).map(|b| b.feature))
+        .filter(|id| app.session.doc.feature(*id).is_some())
+}
+
+/// The feature of the face, edge or vertex under the pointer in the view.
+pub(crate) fn hovered_feature(app: &SolveApp) -> Option<u64> {
+    match &app.viewport.hover {
+        Some(crate::viewport::Hit::Face { body, index, .. }) => geometry_feature(app, body, Some(*index)),
+        Some(crate::viewport::Hit::Edge { body, .. } | crate::viewport::Hit::Vertex { body, .. }) => geometry_feature(app, body, None),
+        _ => None,
+    }
+}
+
+/// The feature of the first face or edge picked in the view.
+pub(crate) fn picked_feature(app: &SolveApp) -> Option<u64> {
+    app.session.selection.iter().find_map(|selection| match selection {
+        solidcraft_engine::Sel::Face { body, index, .. } => geometry_feature(app, body, Some(*index)),
+        solidcraft_engine::Sel::Edge { body, .. } => geometry_feature(app, body, None),
+        _ => None,
+    })
+}
+
+/// A new face or edge picked in the view scrolls the history shown to the feature that made it,
+/// once per pick; the history stays where it is while the pick does not change.
+pub(crate) fn follow_view_pick(app: &mut SolveApp) {
+    let picked = picked_feature(app);
+    if picked == app.tree.view_pick {
+        return;
+    }
+    app.tree.view_pick = picked;
+    if picked.is_some() && app.ui.show_timeline {
+        app.tree.timeline_reveal = picked;
+    }
+}
+
 // Snapshot only the data used by timeline interactions. Cloning FeatureKind here would
 // also copy imported mesh vertices and triangles on every frame.
 #[derive(Clone, Copy)]
@@ -202,11 +242,19 @@ pub(crate) fn delete_feature(app: &mut SolveApp, id: u64) {
 /// while, #2678), then delete them or ask first.
 pub(crate) fn delete_features(app: &mut SolveApp, ids: Vec<u64>) {
     let checks = ids.iter().map(|id| ("timeline.dependents".to_string(), json!({ "feature": id }))).collect();
-    app.check_delete(checks, crate::deferred::AfterCheck::Timeline(ids));
+    app.check_delete(checks, crate::deferred::AfterCheck::Timeline { features: ids, groups: Vec::new() });
 }
 
-/// [`delete_features`] once each feature's `timeline.dependents` report is in.
-pub(crate) fn delete_checked_features(app: &mut SolveApp, ids: Vec<u64>, reports: &[Value]) {
+/// Delete timeline folders with their features (`contents`, nested folders' included) after the
+/// same check as [`delete_features`] (#7219).
+pub(crate) fn delete_folders(app: &mut SolveApp, groups: Vec<u64>, contents: Vec<u64>) {
+    let checks = contents.iter().map(|id| ("timeline.dependents".to_string(), json!({ "feature": id }))).collect();
+    app.check_delete(checks, crate::deferred::AfterCheck::Timeline { features: contents, groups });
+}
+
+/// [`delete_features`] once each feature's `timeline.dependents` report is in; `groups` are
+/// timeline folders deleted with them.
+pub(crate) fn delete_checked_features(app: &mut SolveApp, ids: Vec<u64>, groups: Vec<u64>, reports: &[Value]) {
     // Each report is about one feature alone, so it names the others being deleted too: those
     // go anyway and are left out of the confirmation.
     let deleting: Vec<&str> = ids.iter().filter_map(|id| app.session.doc.feature(*id)).map(|f| f.name.as_str()).collect();
@@ -226,10 +274,15 @@ pub(crate) fn delete_checked_features(app: &mut SolveApp, ids: Vec<u64>, reports
         }
     }
     if with.is_empty() && fail.is_empty() {
-        let _ = app.run_heavy("timeline.delete", json!({ "features": ids }));
+        let _ = app.run_heavy("timeline.delete", delete_params(&ids, &groups));
     } else {
-        app.dialog = Some(crate::dialogs::Dialog::confirm_delete_many(ids, with.into_iter().collect(), fail.into_iter().collect()));
+        app.dialog = Some(crate::dialogs::Dialog::confirm_delete_many(ids, groups, with.into_iter().collect(), fail.into_iter().collect()));
     }
+}
+
+/// `timeline.delete`'s parameters for these features and timeline folders.
+pub(crate) fn delete_params(features: &[u64], groups: &[u64]) -> Value {
+    if groups.is_empty() { json!({ "features": features }) } else { json!({ "features": features, "groups": groups }) }
 }
 
 /// The selected timeline features, in timeline order.
@@ -329,6 +382,23 @@ pub(crate) fn message_button(app: &SolveApp, ui: &mut egui::Ui, id: u64) {
     }
 }
 
+/// Reuse the Browser action so both History layouts edit the same sketch attachment.
+pub(crate) fn sketch_plane_button(app: &mut SolveApp, ui: &mut egui::Ui, id: u64) {
+    if !matches!(app.session.doc.feature(id).map(|feature| &feature.kind), Some(FeatureKind::Sketch { .. })) {
+        return;
+    }
+    let Some(item) =
+        crate::context_menu::items(app, &crate::context_menu::Target::Sketch { id }).into_iter().find(|item| item.id == "ui.redefineSketch")
+    else {
+        return;
+    };
+    let response = crate::context_menu::button_enabled(ui, &item.label, &item.icon, item.enabled);
+    if response.clicked() {
+        crate::context_menu::run_item(app, &item, response.rect.center());
+        ui.close();
+    }
+}
+
 /// Shift+click on a feature: select the features from the anchor (the last feature clicked, or
 /// the last selected one) to this one. `order` is the timeline as drawn this frame, taken before
 /// drawing so the range never mixes two orders. Ctrl as well adds the range to the selection.
@@ -411,9 +481,7 @@ pub fn timeline(app: &mut SolveApp, ui: &mut egui::Ui) {
 }
 
 pub(crate) fn floating_rect(available: Rect) -> Rect {
-    let gap = crate::shell::SHELL_GAP;
-    let inset = available.shrink(gap);
-    Rect::from_min_max(pos2(inset.left(), (inset.bottom() - 40.0).max(inset.top())), inset.max)
+    Container::floating_card(Surface::Panel).bottom_strip_rect(available, 40.0)
 }
 
 fn timeline_contents(app: &mut SolveApp, ui: &mut egui::Ui, floating: bool) {
@@ -431,12 +499,11 @@ fn timeline_contents(app: &mut SolveApp, ui: &mut egui::Ui, floating: bool) {
     let grip = crate::ui_kit::panel_grip(&mut grip_ui).rect;
     x += t.space_10 + t.space_8;
     let mut drag_rect = grip;
-    let label = p.layout_no_wrap(crate::i18n::tr("ui.history_title").to_string(), crate::fonts::semibold(t.font_heading), t.text);
-    if x + label.size().x + t.space_12 + crate::ui_kit::history_transport_width() <= r.right() {
-        let title_rect = Rect::from_min_size(pos2(x, r.center().y - label.size().y / 2.0), label.size());
-        p.galley(title_rect.min, label.clone(), t.text);
+    let heading = crate::ui_kit::StripHeading::new(&p, crate::i18n::tr("ui.history_title"));
+    if x + heading.width() + crate::ui_kit::history_transport_width() <= r.right() {
+        let title_rect = heading.paint(&p, Rect::from_min_max(pos2(x, r.top()), r.right_bottom()));
         drag_rect = drag_rect.union(title_rect);
-        x += label.size().x + t.space_12;
+        x += heading.width();
     }
     let response = ui.interact(drag_rect, egui::Id::new("sc_history_dock_grip"), Sense::drag());
     crate::scenario::publish_handle("history:grip", drag_rect.center());
@@ -497,14 +564,8 @@ fn timeline_contents(app: &mut SolveApp, ui: &mut egui::Ui, floating: bool) {
             let order: Vec<u64> = feats.iter().map(|f| f.0).collect();
             // Find in Timeline: scroll the found feature into the strip on this frame (#5850).
             let reveal = app.tree.timeline_reveal.take();
-            // The feature whose body is under the cursor in the viewport.
-            let st = app.session.world_state();
-            let from_view = match &app.viewport.hover {
-                Some(
-                    crate::viewport::Hit::Face { body, .. } | crate::viewport::Hit::Edge { body, .. } | crate::viewport::Hit::Vertex { body, .. },
-                ) => st.body(body).map(|b| b.feature),
-                _ => None,
-            };
+            // The feature that made what is under the cursor or picked in the viewport.
+            let from_view = [hovered_feature(app), picked_feature(app)];
             let drag_id = ui.id().with("tl_drag");
             let mut drag: Option<Drag> = ui.data(|d| d.get_temp(drag_id));
             let pointer = ui.input(|i| i.pointer.hover_pos());
@@ -512,7 +573,10 @@ fn timeline_contents(app: &mut SolveApp, ui: &mut egui::Ui, floating: bool) {
             let mut hovered: Option<u64> = None;
             let mut edit: Option<u64> = None;
             let mut marker_rect: Option<Rect> = None;
+            // Each sketch's solve state, read once for the strip (#7245).
+            let sketch_states = crate::sketch_state::SketchStates::of(app);
             for (i, (id, name, icon, suppressed, ty, kind)) in feats.iter().enumerate() {
+                let sketch_state = matches!(kind, TimelineKind::Sketch).then(|| sketch_states.get(*id)).flatten();
                 if i == marker {
                     marker_rect = Some(Rect::from_min_size(pos2(x, r.top() + 5.0), vec2(t.space_12, r.height() - 10.0)));
                     x += t.space_16;
@@ -538,12 +602,13 @@ fn timeline_contents(app: &mut SolveApp, ui: &mut egui::Ui, floating: bool) {
                     name,
                     kind: ty,
                     selected: sel,
-                    hovered: resp.hovered() || from_view == Some(*id),
+                    hovered: resp.hovered() || from_view.contains(&Some(*id)),
                     dim: rolled,
                     suppressed: *suppressed,
                     error: err.is_some(),
                     warning: warn.is_some(),
                     reference: false,
+                    ink: sketch_state.and_then(|state| state.ink(&t)),
                     // A dragged feature takes the colour of its drop bar.
                     accent: if drag == Some(Drag::Feature(*id)) { crate::theme::TabAccent::for_tab(&t, "SKETCH") } else { accent },
                 }
@@ -552,6 +617,10 @@ fn timeline_contents(app: &mut SolveApp, ui: &mut egui::Ui, floating: bool) {
                     p.circle_filled(pos2(br.center().x, br.bottom() + t.space_3), t.space_2, accent.color);
                 }
                 let mut tip = status_text(name, ty, err.as_deref(), warn.as_deref());
+                if let Some(state) = sketch_state {
+                    tip.push('\n');
+                    tip.push_str(&state.text());
+                }
                 if let Some(r) = res {
                     tip += &format!("\n{:.1} ms", r.ms);
                 }
@@ -580,6 +649,7 @@ fn timeline_contents(app: &mut SolveApp, ui: &mut egui::Ui, floating: bool) {
                         edit = Some(*id);
                         ui.close();
                     }
+                    sketch_plane_button(app, ui, *id);
                     if let Some(sk) = sketch_of
                         && crate::context_menu::button(ui, crate::i18n::tr_label("Edit Profile Sketch"), "sketch").clicked()
                     {
@@ -590,7 +660,10 @@ fn timeline_contents(app: &mut SolveApp, ui: &mut egui::Ui, floating: bool) {
                         app.dialog = Some(crate::dialogs::Dialog::rename(*id, name));
                         ui.close();
                     }
-                    if crate::context_menu::button(ui, if *suppressed { "Unsuppress Features" } else { "Suppress Features" }, "suppress").clicked() {
+                    // Its own message, not a literal: no catalog held the literal, so the item
+                    // stayed English in every language (#8301).
+                    let suppress = if *suppressed { "timeline.unsuppress_features" } else { "timeline.suppress_features" };
+                    if crate::context_menu::button(ui, crate::i18n::tr(suppress), "suppress").clicked() {
                         let _ = app.run_heavy("timeline.suppress", json!({"feature": id}));
                         ui.close();
                     }
@@ -720,6 +793,7 @@ fn find_in_browser(app: &mut SolveApp, id: u64) {
 #[cfg(test)]
 mod tests {
     use serde_json::json;
+    use solidcraft_engine::doc::{FeatureKind, PlaneRef};
 
     use crate::scenario::Harness;
 
@@ -760,6 +834,41 @@ mod tests {
             let texts: Vec<_> = crate::test_support::text_shapes(&output).map(|t| t.galley.text()).collect();
             assert!(texts.contains(&expected), "left={left}: {texts:?}");
         }
+    }
+
+    /// #8301: the feature menu's suppress item is drawn from the catalog, so it follows the
+    /// reader's language. The literals it used were in no catalog and stayed English in every
+    /// language, the Japanese UI included.
+    #[test]
+    fn the_feature_menu_suppress_item_follows_the_language() {
+        let mut h = two_boxes(false);
+        h.app.preferences.language = "ja".into();
+        h.frames(2);
+        let painted = |h: &Harness| -> Vec<String> {
+            let output = egui::FullOutput { shapes: h.shapes.clone(), ..Default::default() };
+            crate::test_support::text_shapes(&output).map(|t| t.galley.text().to_string()).collect()
+        };
+        // No English on screen: the item shows the reader's language.
+        h.step(&json!({"click": {"handle": "timeline:First"}, "button": "right"})).unwrap();
+        let texts = painted(&h);
+        assert!(!texts.iter().any(|t| t == "Suppress Features"), "the English literal is painted in the Japanese UI: {texts:?}");
+        let ja = crate::i18n::Locale::for_language("ja").text("timeline.suppress_features").to_string();
+        let ja_unsuppress = crate::i18n::Locale::for_language("ja").text("timeline.unsuppress_features").to_string();
+        assert!(texts.contains(&ja), "the item must read {ja}: {texts:?}");
+        h.step(&json!({"key": "Escape"})).unwrap();
+        // A suppressed feature offers the other way round.
+        let first = h.app.session.doc.find_feature("First").map(|f| f.id).unwrap();
+        h.app.run("timeline.suppress", json!({"feature": first, "suppressed": true})).unwrap();
+        h.frames(2);
+        h.step(&json!({"click": {"handle": "timeline:First"}, "button": "right"})).unwrap();
+        let texts = painted(&h);
+        assert!(!texts.iter().any(|t| t == "Unsuppress Features"), "the English literal is painted in the Japanese UI: {texts:?}");
+        assert!(texts.contains(&ja_unsuppress), "the item must read {ja_unsuppress}: {texts:?}");
+        h.step(&json!({"key": "Escape"})).unwrap();
+        // The English wording is the one the menu always showed: the change adds messages, it
+        // does not reword the item.
+        assert_eq!(crate::i18n::Locale::for_language("en").text("timeline.suppress_features"), "Suppress Features");
+        assert_eq!(crate::i18n::Locale::for_language("en").text("timeline.unsuppress_features"), "Unsuppress Features");
     }
 
     #[test]
@@ -865,6 +974,53 @@ mod tests {
         h
     }
 
+    #[test]
+    fn sketch_context_menu_redefines_the_plane_in_both_timelines() {
+        for left in [false, true] {
+            let mut h = two_boxes(left);
+            let sketch = h.app.run("sketch.create", json!({"plane":"XY","name":"Profile"})).unwrap()["sketch"].as_u64().unwrap();
+            h.app.run("sketch.rectangle.two_point", json!({"p0":[1,1],"p1":[8,6]})).unwrap();
+            h.app.finish_sketch();
+            h.settle();
+            let before = h.app.session.doc.to_json();
+            let raw = serde_json::to_value(h.app.session.doc.sketch(sketch).unwrap()).unwrap();
+            let marker = h.app.session.doc.marker;
+            let undo = h.app.session.undo.len();
+            let item = crate::context_menu::items(&h.app, &crate::context_menu::Target::Sketch { id: sketch })
+                .into_iter()
+                .find(|item| item.id == "ui.redefineSketch")
+                .unwrap();
+            h.step(&json!({"click":{"handle":"timeline:First"},"button":"right"})).unwrap();
+            assert!(h.widget(&item.label).is_none(), "a body feature has no sketch plane");
+            h.step(&json!({"key":"Escape"})).unwrap();
+            for apply in [false, true] {
+                h.step(&json!({"click":{"handle":"timeline:Profile"},"button":"right"})).unwrap();
+                h.step(&json!({"widget":item.label})).unwrap();
+                assert_eq!(h.app.tree.redefine, Some(sketch));
+                assert_eq!(h.app.session.doc.to_json(), before, "opening the menu changes no geometry");
+                h.step(&json!({"widget":"Use XZ plane"})).unwrap();
+                h.settle();
+                h.step(&json!({"click":{"handle":if apply { "dialog:ok" } else { "dialog:cancel" }}})).unwrap();
+                assert!(h.app.tree.redefine.is_none());
+                assert_eq!(h.app.session.doc.marker, marker);
+                assert_eq!(serde_json::to_value(h.app.session.doc.sketch(sketch).unwrap()).unwrap(), raw);
+                if apply {
+                    assert!(matches!(&h.app.session.doc.feature(sketch).unwrap().kind,
+                        FeatureKind::Sketch { plane: PlaneRef::Origin { name }, .. } if name == "XZ"));
+                    assert_eq!(h.app.session.undo.len(), undo + 1);
+                    let after = h.app.session.doc.to_json();
+                    h.app.run("edit.undo", json!({})).unwrap();
+                    assert_eq!(h.app.session.doc.to_json(), before);
+                    h.app.run("edit.redo", json!({})).unwrap();
+                    assert_eq!(h.app.session.doc.to_json(), after);
+                } else {
+                    assert_eq!(h.app.session.doc.to_json(), before);
+                    assert_eq!(h.app.session.undo.len(), undo);
+                }
+            }
+        }
+    }
+
     /// A timeline wider than the window scrolls with a plain mouse wheel (#3356).
     #[test]
     fn the_mouse_wheel_scrolls_a_long_timeline() {
@@ -913,6 +1069,52 @@ mod tests {
             assert_eq!(h.app.session.selection, [solidcraft_engine::Sel::Feature { id: last }], "left={left}");
             assert!(shown(&h), "left={left}: Find in Timeline scrolled the found feature into the timeline");
             assert!(h.app.tree.timeline_reveal.is_none(), "left={left}: the request is done once drawn");
+        }
+    }
+
+    /// A face picked in the view lights the feature that made it, the hole rather than the block
+    /// it was cut into, and scrolls both timelines to it once; hovering finds the same feature.
+    #[test]
+    fn a_face_picked_in_the_view_scrolls_both_timelines_to_the_feature_that_made_it() {
+        for left in [false, true] {
+            let mut h = Harness::new();
+            h.app.preferences.timeline_left = left;
+            let block =
+                h.app.run("solid.box", json!({"length": 20, "width": 20, "height": 10, "name": "Block", "body_name": "Plate"})).unwrap()["feature"]
+                    .as_u64()
+                    .unwrap();
+            for i in 0..80 {
+                h.app.run("sketch.create", json!({"plane": "XY", "name": format!("S{i}")})).unwrap();
+                h.app.run("sketch.finish", json!({})).unwrap();
+            }
+            let hole = h
+                .app
+                .run("solid.cylinder", json!({"base": [10, 10, -1], "radius": 3, "height": 12, "operation": "cut", "name": "Hole"}))
+                .unwrap()["feature"]
+                .as_u64()
+                .unwrap();
+            h.app.run("select.clear", json!({})).unwrap();
+            h.frames(4);
+            let shown = |h: &Harness| h.app.shell.history.unwrap().contains(crate::scenario::handle_at("timeline:Hole").unwrap());
+            assert!(!shown(&h), "left={left}: the hole starts outside the timeline");
+
+            let state = h.app.session.world_state();
+            let body = state.bodies.first().unwrap();
+            let names = solidcraft_engine::doc::naming::face_names(body);
+            let index = names.iter().position(|name| solidcraft_engine::doc::persistent_name::made_by(name) == Some(hole)).unwrap();
+            let plate = body.name.clone();
+            h.app.viewport.hover = Some(crate::viewport::Hit::Face { body: plate.clone(), index, point: solidcraft_engine::geom::Vec3::ZERO });
+            assert_eq!(crate::timeline::hovered_feature(&h.app), Some(hole), "left={left}: hovering the hole's face finds the hole");
+            h.app.viewport.hover = Some(crate::viewport::Hit::Vertex { body: plate.clone(), point: solidcraft_engine::geom::Vec3::ZERO });
+            assert_eq!(crate::timeline::hovered_feature(&h.app), Some(block), "left={left}: a vertex finds the feature that made its body");
+            h.app.viewport.hover = None;
+
+            h.app.run("select.set", json!({"items": [{"type": "face", "body": plate, "index": index, "point": [0, 0, 0]}]})).unwrap();
+            h.frames(30);
+            assert_eq!(crate::timeline::picked_feature(&h.app), Some(hole), "left={left}");
+            assert_eq!(h.app.tree.view_pick, Some(hole), "left={left}");
+            assert!(shown(&h), "left={left}: the pick scrolled the hole into the timeline");
+            assert!(h.app.tree.timeline_reveal.is_none(), "left={left}: once, not on every frame");
         }
     }
 

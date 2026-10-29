@@ -155,14 +155,15 @@ fn toast_stays_in_free_content_above_history_and_navigation() {
                     let content = crate::shell::content_rect(&h.app, layout.viewport);
                     let mut obstacles = crate::shell::covered_rects(&h.app);
                     obstacles.extend([layout.navigation, layout.axis_view]);
-                    let free = crate::viewport_layout::free_rect(content, &obstacles).shrink(Tokens::get().space_8);
+                    // The default place: the bottom of the corner column (#7893).
+                    let free = corner_free(content, &obstacles);
                     if let Some(toast) = crate::scenario::rect_of("toast") {
                         assert!(toast.is_finite() && toast.is_positive());
                         assert!(content.contains_rect(toast), "{mode:?}, {scale}, {width}x{height}: {toast:?}");
                         for obstacle in obstacles {
                             assert!(!toast.intersect(obstacle).is_positive(), "{toast:?} intersects {obstacle:?}");
                         }
-                        assert!((toast.center().x - free.center().x).abs() < 0.01);
+                        assert!((toast.right() - free.right()).abs() < 0.01, "against the column's right: {toast:?} {free:?}");
                         assert!((toast.bottom() - free.bottom()).abs() < 0.01);
                     } else {
                         assert!(free.width() < 200.0 || free.height() < 40.0, "toast unexpectedly absent: {free:?}");
@@ -359,11 +360,13 @@ fn compass_circle_grabs_on_hover_and_the_home_chip_points() {
     assert_ne!(h.output.cursor_icon, egui::CursorIcon::Grab, "no hand away from the compass");
 }
 
-/// The status and computing toasts keep the size and place they always had: the text's size plus
-/// 40 by 16, centred at the bottom of the free rect.
+/// At the bottom centre (the `centre` preference, the place before #7893) the status and computing
+/// toasts keep the size and place they always had: the text's size plus 40 by 16, centred at the
+/// bottom of the free rect.
 #[test]
 fn the_shared_toast_draws_old_callers_exactly_as_before() {
     let ctx = crate::fonts::test_context();
+    ToastPlace::Centre.publish(&ctx);
     for width in [200.0_f32, 300.0, 500.0, 900.0] {
         let free = Rect::from_min_size(pos2(10.0, 20.0), vec2(width, 200.0));
         for (error, computing) in [(false, false), (true, false), (false, true)] {
@@ -408,7 +411,7 @@ fn toast_buttons_wrap_inside_the_card_and_are_dead_behind_an_issue_report() {
                 seen
             };
             run(vec![]);
-            let (card, _) = run(vec![]).unwrap_or_else(|| panic!("width {width}: no card"));
+            let (card, _, _) = run(vec![]).unwrap_or_else(|| panic!("width {width}: no card"));
             assert!(free.contains_rect(card), "width {width}: {card:?}");
             let mut hits = Vec::new();
             for step_x in 1..12 {
@@ -427,7 +430,7 @@ fn toast_buttons_wrap_inside_the_card_and_are_dead_behind_an_issue_report() {
                         pressed: false,
                         modifiers: Default::default(),
                     }]);
-                    if let Some((_, Some(index))) = clicked {
+                    if let Some((_, Some(index), _)) = clicked {
                         hits.push(index);
                     }
                 }
@@ -606,4 +609,134 @@ fn frame_rate_readout_stays_beside_a_right_pane() {
         assert!(rect_of("agent_chat:panel").is_some());
         in_corner(&h);
     }
+}
+
+/// The View angles readout (#6032) sits under the orientation gizmo only while View ▸ View angles
+/// is on, follows the view live with its projection, and its card turns the view to typed angles
+/// through `view.apply`, without touching the design or its history.
+#[test]
+fn view_angles_readout_shows_only_when_on_and_applies_typed_angles() {
+    use solidcraft_engine::render::ViewAngles;
+    for style in ["axes", "cube"] {
+        let mut h = Harness::new();
+        h.call("ui.prefs", json!({"navigator_style": style}));
+        h.app.preferences.look_at_anim = false;
+        h.settle();
+        let design = h.app.session.doc.to_json();
+        assert!(!h.app.preferences.show_view_angles, "off by default");
+        assert!(crate::scenario::rect_of("view_angles:readout").is_none());
+        // View ▸ View angles runs view.angle_readout.
+        let view = crate::scenario::handle_at("nav:view").unwrap();
+        h.call("ui.click", json!({"x": view.x, "y": view.y}));
+        let check = crate::scenario::handle_at("view:view_angles").unwrap();
+        h.call("ui.click", json!({"x": check.x, "y": check.y}));
+        assert!(h.app.preferences.show_view_angles);
+        h.call("ui.click", json!({"x": view.x, "y": view.y}));
+        h.call("ui.view", json!({"view": "front"}));
+        h.settle();
+        let readout = crate::scenario::rect_of("view_angles:readout").expect("the readout shows once it is on");
+        let axis = crate::scenario::rect_of("axis_view:outer").unwrap();
+        assert!(
+            readout.top() >= axis.bottom() && readout.right() <= axis.right() && readout.right() > axis.center().x,
+            "{style}: {readout:?} under {axis:?}"
+        );
+        let lines = |h: &Harness| crate::view_angles::lines(&h.app);
+        assert_eq!(lines(&h), ("Pitch 0.0° · Yaw 0.0° · Roll 0.0°".to_string(), "Ortho".to_string()));
+        h.call("ui.view", json!({"view": "right"}));
+        h.app.ui.perspective = true;
+        h.settle();
+        assert_eq!(lines(&h), ("Pitch 0.0° · Yaw -90.0° · Roll 0.0°".to_string(), "Persp".to_string()));
+        h.call("ui.view", json!({"view": "top"}));
+        h.settle();
+        assert_eq!(lines(&h).0, "Pitch 90.0° · Yaw 0.0° · Roll 0.0°");
+        // A click on the readout opens the card with the current angles; Apply turns the view.
+        let camera = h.app.cam;
+        h.call("ui.click", json!({"x": readout.center().x, "y": readout.center().y}));
+        assert_eq!(h.app.cam, camera, "the click opens the card, it does not move the view");
+        assert!(crate::scenario::rect_of("view_angles:card").is_some());
+        let draft = h.ctx.data(|d| d.get_temp::<ViewAngles>(crate::view_angles::draft_id())).expect("the card holds the typed angles");
+        assert!((draft.pitch - 90.0).abs() < 1e-3 && draft.yaw == 0.0 && draft.roll == 0.0, "{draft:?}");
+        h.ctx.data_mut(|d| d.insert_temp(crate::view_angles::draft_id(), ViewAngles { yaw: 30.0, pitch: 15.0, roll: -10.0 }));
+        h.frame();
+        let apply = crate::scenario::handle_at("dialog:button:Apply").unwrap();
+        h.call("ui.click", json!({"x": apply.x, "y": apply.y}));
+        h.settle();
+        let a = h.app.cam.view_angles();
+        assert!((a.yaw - 30.0).abs() < 1e-9 && (a.pitch - 15.0).abs() < 1e-9 && (a.roll + 10.0).abs() < 1e-9, "{a:?}");
+        assert_eq!((h.app.cam.target, h.app.cam.distance), (camera.target, camera.distance), "only the orientation changes");
+        assert_eq!(lines(&h).0, "Pitch 15.0° · Yaw 30.0° · Roll -10.0°");
+        // A click elsewhere closes the card; the command turns the readout off again.
+        let centre = h.app.viewport.rect.unwrap().center();
+        h.call("ui.click", json!({"x": centre.x, "y": centre.y}));
+        assert!(crate::scenario::rect_of("view_angles:card").is_none());
+        h.call("engine.execute", json!({"command": "view.angle_readout", "params": {"enabled": false}}));
+        h.settle();
+        assert!(!h.app.preferences.show_view_angles);
+        assert!(crate::scenario::rect_of("view_angles:readout").is_none());
+        assert_eq!(h.app.session.doc.to_json(), design);
+        assert!(h.app.session.undo.is_empty());
+    }
+}
+
+/// In the corner (#7893) the buttons sit as in the dialogs: right-aligned, dismissals first and the
+/// main action right-most; when they wrap, the row with the main action is the bottom one.
+#[test]
+fn corner_toast_buttons_follow_the_dialogs_and_keep_the_main_action_bottom_right() {
+    use ToastKind::{Dismiss, Primary, Secondary};
+    let row_width = TOAST_WIDTH - 40.0;
+    // Three short ones fit one row: Close, Don't ask again, Stand it up.
+    let three = [(90.0, Primary), (110.0, Secondary), (50.0, Dismiss)];
+    let spots = toast_action_spots_trailing(&three, row_width, 8.0, 28.0);
+    assert!(spots.iter().all(|s| s.top() == 0.0), "one row: {spots:?}");
+    assert!((spots[0].right() - row_width).abs() < 0.01, "the main action is right-most: {spots:?}");
+    assert!(spots[2].right() < spots[1].left() && spots[1].right() < spots[0].left(), "dismiss, alternative, main: {spots:?}");
+    // The 3D mouse offer's four wrap: the main action and its alternative below, the dismissals above.
+    let four = [(90.0, Primary), (190.0, Secondary), (50.0, Dismiss), (120.0, Dismiss)];
+    let spots = toast_action_spots_trailing(&four, row_width, 8.0, 28.0);
+    let bottom = spots.iter().map(|s| s.top()).fold(0.0, f32::max);
+    assert!(bottom > 0.0, "wrapped: {spots:?}");
+    assert_eq!(spots[0].top(), bottom, "the main action is on the bottom row");
+    assert!((spots[0].right() - row_width).abs() < 0.01, "and right-most");
+    for (i, spot) in spots.iter().enumerate() {
+        assert!(spot.left() >= -0.01 && spot.right() <= row_width + 0.01, "inside the row: {spot:?}");
+        for other in &spots[i + 1..] {
+            assert!(!spot.intersects(*other), "{spot:?} overlaps {other:?}");
+        }
+    }
+    // Hostile widths never panic and give one spot per button.
+    for bad in [f32::NAN, f32::INFINITY, -5.0, 0.0] {
+        assert_eq!(toast_action_spots_trailing(&four, bad, 8.0, 28.0).len(), 4);
+    }
+}
+
+/// In the corner every toast is `TOAST_WIDTH` wide, whatever its text, and sits against the right of
+/// `free`; at the centre (the old place, a preference) each is as wide as its text, centred.
+#[test]
+fn corner_toasts_share_one_width_against_the_right_edge() {
+    let ctx = crate::fonts::test_context();
+    let free = Rect::from_min_size(pos2(0.0, 0.0), vec2(1200.0, 700.0));
+    for place in [ToastPlace::Corner, ToastPlace::Centre] {
+        place.publish(&ctx);
+        let mut rects = Vec::new();
+        draw(&ctx, |ui| {
+            for text in ["Open done", "Calibrating your 3D mouse fixes swapped or reversed axes and sets its speed and feel."] {
+                rects.push(paint_toast(ui, free, text.into(), false, false).unwrap());
+            }
+        });
+        match place {
+            ToastPlace::Corner => {
+                for r in &rects {
+                    assert!((r.width() - TOAST_WIDTH).abs() < 0.5, "{r:?}");
+                    assert!((r.right() - free.right()).abs() < 0.5, "against the right edge: {r:?}");
+                }
+            }
+            ToastPlace::Centre => {
+                assert!(rects[0].width() < rects[1].width(), "as wide as their text: {rects:?}");
+                for r in &rects {
+                    assert!((r.center().x - free.center().x).abs() < 0.5, "centred: {r:?}");
+                }
+            }
+        }
+    }
+    ToastPlace::Corner.publish(&ctx);
 }
